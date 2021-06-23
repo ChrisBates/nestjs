@@ -1,0 +1,2 @@
+test/__fixtures__/hasura/metadata/databases/additional/tables/public_additional_table.yaml
+test/__fixtures__/hasura/metadata/databases/default/tables/public_default_table.yaml

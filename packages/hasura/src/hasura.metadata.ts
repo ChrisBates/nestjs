@@ -10,12 +10,13 @@ import { readFileSync, writeFileSync } from 'fs';
 import { orderBy } from 'lodash';
 import {
   TableEntry,
-  EventTriggerDefinition,
-  Columns,
   CronTrigger,
 } from './hasura-metadata-dist/HasuraMetadataV2';
+import { mergeEventHandlerConfig } from './metadata/event-triggers';
 
 const utf8 = 'utf-8';
+
+const MISSING_META_CONFIG = 'No configuration for meta available';
 
 const defaultHasuraRetryConfig: ScheduledEventRetryConfig = {
   intervalInSeconds: 10,
@@ -24,49 +25,20 @@ const defaultHasuraRetryConfig: ScheduledEventRetryConfig = {
   toleranceSeconds: 21600,
 };
 
-const convertEventTriggerDefinition = (
-  configDef: TrackedHasuraEventHandlerConfig['definition']
-): EventTriggerDefinition => {
-  if (configDef.type === 'insert') {
-    return {
-      enable_manual: false,
-      insert: {
-        columns: Columns.Empty,
-      },
-    };
-  }
-
-  if (configDef.type === 'delete') {
-    return {
-      enable_manual: false,
-      delete: {
-        columns: Columns.Empty,
-      },
-    };
-  }
-
-  return {
-    enable_manual: false,
-    update: {
-      columns: configDef.columns ?? Columns.Empty,
-    },
-  };
-};
-
 export const isTrackedHasuraEventHandlerConfig = (
   eventHandlerConfig: HasuraEventHandlerConfig | TrackedHasuraEventHandlerConfig
 ): eventHandlerConfig is TrackedHasuraEventHandlerConfig => {
   return 'definition' in eventHandlerConfig;
 };
 
-export const updateEventTriggerMeta = (
+const updateEventTriggerMetaV2 = (
   moduleConfig: HasuraModuleConfig,
   eventHandlerConfigs: TrackedHasuraEventHandlerConfig[]
 ) => {
   const { managedMetaDataConfig } = moduleConfig;
 
   if (!managedMetaDataConfig) {
-    throw new Error('No configuration for meta available');
+    throw new Error(MISSING_META_CONFIG);
   }
 
   const defaultRetryConfig =
@@ -78,13 +50,8 @@ export const updateEventTriggerMeta = (
   const tableEntries = safeLoad(tablesMeta) as TableEntry[];
 
   orderBy(eventHandlerConfigs, (x) => x.triggerName).forEach((config) => {
-    const {
-      schema = 'public',
-      tableName,
-      triggerName,
-      definition,
-      retryConfig = defaultRetryConfig,
-    } = config;
+    const { schema = 'public', tableName } = config;
+
     const matchingTable = tableEntries.find(
       (x) => x.table.schema === schema && x.table.name === tableName
     );
@@ -95,34 +62,69 @@ export const updateEventTriggerMeta = (
       );
     }
 
-    const { intervalInSeconds, numRetries, timeoutInSeconds } = retryConfig;
-    const eventTriggers = (matchingTable.event_triggers ?? []).filter(
-      (x) => x.name !== triggerName
+    matchingTable.event_triggers = mergeEventHandlerConfig(
+      config,
+      moduleConfig,
+      defaultRetryConfig,
+      matchingTable
     );
-
-    matchingTable.event_triggers = [
-      ...eventTriggers,
-      {
-        name: triggerName,
-        definition: convertEventTriggerDefinition(definition),
-        retry_conf: {
-          num_retries: numRetries,
-          interval_sec: intervalInSeconds,
-          timeout_sec: timeoutInSeconds,
-        },
-        webhook_from_env: managedMetaDataConfig.nestEndpointEnvName,
-        headers: [
-          {
-            name: moduleConfig.webhookConfig.secretHeader,
-            value_from_env: managedMetaDataConfig.secretHeaderEnvName,
-          },
-        ],
-      },
-    ];
   });
 
   const yamlString = safeDump(tableEntries);
   writeFileSync(tablesYamlPath, yamlString, utf8);
+};
+
+const updateEventTriggerMetaV3 = (
+  moduleConfig: HasuraModuleConfig,
+  eventHandlerConfigs: TrackedHasuraEventHandlerConfig[]
+) => {
+  const { managedMetaDataConfig } = moduleConfig;
+
+  if (!managedMetaDataConfig) {
+    throw new Error(MISSING_META_CONFIG);
+  }
+
+  const defaultRetryConfig =
+    managedMetaDataConfig.defaultEventRetryConfig ?? defaultHasuraRetryConfig;
+
+  eventHandlerConfigs.forEach((config) => {
+    const { schema = 'public', databaseName = 'default', tableName } = config;
+
+    const tableYamlPath = `${managedMetaDataConfig.dirPath}/databases/${databaseName}/tables/${schema}_${tableName}.yaml`;
+    const tableMeta = readFileSync(tableYamlPath, utf8);
+    const tableEntry = safeLoad(tableMeta) as TableEntry;
+
+    tableEntry.event_triggers = mergeEventHandlerConfig(
+      config,
+      moduleConfig,
+      defaultRetryConfig,
+      tableEntry
+    );
+
+    const yamlString = safeDump(tableEntry);
+    writeFileSync(tableYamlPath, yamlString, utf8);
+  });
+};
+
+export const updateEventTriggerMeta = (
+  moduleConfig: HasuraModuleConfig,
+  eventHandlerConfigs: TrackedHasuraEventHandlerConfig[]
+) => {
+  const { managedMetaDataConfig } = moduleConfig;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  const { metadataVersion = 3 } = moduleConfig.managedMetaDataConfig!;
+
+  if (!managedMetaDataConfig) {
+    throw new Error(MISSING_META_CONFIG);
+  }
+
+  if (metadataVersion === 2) {
+    updateEventTriggerMetaV2(moduleConfig, eventHandlerConfigs);
+  } else if (metadataVersion === 3) {
+    updateEventTriggerMetaV3(moduleConfig, eventHandlerConfigs);
+  } else {
+    throw new Error(`Invalid Hasura metadata version: ${metadataVersion}`);
+  }
 };
 
 export const updateScheduledEventTriggerMeta = (
@@ -132,7 +134,7 @@ export const updateScheduledEventTriggerMeta = (
   const { managedMetaDataConfig } = moduleConfig;
 
   if (!managedMetaDataConfig) {
-    throw new Error('No configuration for meta available');
+    throw new Error(MISSING_META_CONFIG);
   }
 
   const cronTriggersYamlPath = `${managedMetaDataConfig.dirPath}/cron_triggers.yaml`;
